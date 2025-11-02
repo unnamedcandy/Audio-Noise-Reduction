@@ -1,0 +1,8 @@
+Epoch 001/50 | Avg Loss: 0.078288 | LR: 0.000100 | Time: 6020.25s
+Epoch 002/50 | Avg Loss: 0.074082 | LR: 0.000100 | Time: 5953.47s
+Epoch 003/50 | Avg Loss: 0.072998 | LR: 0.000100 | Time: 5951.47s
+Epoch 004/50 | Avg Loss: 0.072579 | LR: 0.000100 | Time: 5953.19s
+Epoch 005/50 | Avg Loss: 0.072327 | LR: 0.000100 | Time: 5952.09s
+Epoch 006/50 | Avg Loss: 0.072147 | LR: 0.000100 | Time: 5951.74s
+Epoch 007/50 | Avg Loss: 0.072024 | LR: 0.000100 | Time: 5953.75s
+Epoch 008/50 | Avg Loss: 0.071942 | LR: 0.000100 | Time: 5947.90s
