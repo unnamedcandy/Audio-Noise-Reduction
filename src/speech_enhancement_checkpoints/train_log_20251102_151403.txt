@@ -1,5 +1,0 @@
-Epoch 001/50 | Avg Loss: 0.080914 | LR: 0.001000 | Time: 3133.21s
-Epoch 002/50 | Avg Loss: 0.074631 | LR: 0.001000 | Time: 3121.20s
-Epoch 003/50 | Avg Loss: 0.074000 | LR: 0.001000 | Time: 3107.67s
-Epoch 004/50 | Avg Loss: 0.073476 | LR: 0.001000 | Time: 3098.29s
-Epoch 005/50 | Avg Loss: 0.073181 | LR: 0.001000 | Time: 3103.62s
