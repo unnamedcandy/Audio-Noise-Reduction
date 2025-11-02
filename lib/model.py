@@ -6,8 +6,8 @@ class UNetSpeechEnhancement(nn.Module):
     def __init__(self, in_channels=2, out_channels=2, base_filters=16):
         """
         适用于语音频谱增强的U-Net模型
-        输入/输出形状: (batch_size, 2, 2048, 512)
-        其中通道维度对应：[幅度谱, 相位谱]
+        输入/输出形状: (batch_size, 2048, 512, 2)
+        其中通道维度（最后一维）对应：[幅度谱, 相位谱]
 
         参数:
             in_channels: 输入通道数（固定为2，幅度+相位）
@@ -78,9 +78,13 @@ class UNetSpeechEnhancement(nn.Module):
 
     def forward(self, x):
         """
-        前向传播：输入带噪频谱，输出干净频谱
-        x shape: (batch_size, 2, 2048, 512)  # [batch, 幅度/相位, 时间帧, 频率bin]
+        前向传播：输入带噪频谱（通道在最后），输出干净频谱（通道在最后）
+        x shape: (batch_size, 2048, 512, 2)  # [batch, 时间帧, 频率bin, 幅度/相位通道]
         """
+        # 核心调整：通道最后→通道优先（PyTorch卷积层要求输入为通道优先格式）
+        # (batch, time, freq, channels) → (batch, channels, time, freq)
+        x = x.permute(0, 3, 1, 2)
+
         # 编码器特征提取 + 保存中间特征（用于跳跃连接）
         enc1 = self.encoder1(x)  # (batch, 16, 2048, 512)
         enc2 = self.encoder2(self.pool1(enc1))  # (batch, 32, 1024, 256)
@@ -109,13 +113,18 @@ class UNetSpeechEnhancement(nn.Module):
 
         # 输出层：恢复为2通道（干净语音的幅度谱+相位谱）
         out = self.out_conv(dec1)  # (batch, 2, 2048, 512)
+
+        # 核心调整：通道优先→通道最后（恢复输出格式）
+        # (batch, channels, time, freq) → (batch, time, freq, channels)
+        out = out.permute(0, 2, 3, 1)
+
         return out
 
 
-# 验证模型输入输出形状匹配性
+# 验证模型输入输出形状匹配性（通道在最后格式）
 if __name__ == "__main__":
-    # 模拟STFT处理后的带噪频谱特征 (batch_size=2, channels=2, time=2048, frequency=512)
-    dummy_input = torch.randn(2, 2, 2048, 512)
+    # 模拟STFT处理后的带噪频谱特征 (batch_size=2, time=2048, frequency=512, channels=2)
+    dummy_input = torch.randn(2, 2048, 512, 2)  # 通道在最后
 
     # 初始化模型
     model = UNetSpeechEnhancement()
@@ -124,6 +133,6 @@ if __name__ == "__main__":
     dummy_output = model(dummy_input)
 
     # 验证形状
-    print(f"输入形状: {dummy_input.shape}")  # 应输出: torch.Size([2, 2, 2048, 512])
-    print(f"输出形状: {dummy_output.shape}")  # 应输出: torch.Size([2, 2, 2048, 512])
-    print("模型输入输出形状匹配，可用于频谱域语音增强任务！")
+    print(f"输入形状: {dummy_input.shape}")  # 应输出: torch.Size([2, 2048, 512, 2])
+    print(f"输出形状: {dummy_output.shape}")  # 应输出: torch.Size([2, 2048, 512, 2])
+    print("模型输入输出形状匹配（通道在最后），可用于频谱域语音增强任务！")

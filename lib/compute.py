@@ -1,9 +1,5 @@
-# 导入必要的工具库，涵盖音频处理、数值计算、语音识别等核心功能
-import os  # （备用）用于文件路径操作、目录管理，当前代码未直接使用
 import librosa  # 音频处理核心库：提供分帧、采样率转换、特征提取等功能
 import numpy as np  # 数值计算库：处理音频数组、矩阵运算（如MGC系数计算、距离求解）
-import soundfile as sf  # （备用）音频读写库：支持更多格式，兼容性优于wavfile，当前代码未直接使用
-import pandas as pd  # （备用）表格数据处理库：可用于批量存储多组MCD/WER评估结果，当前代码未直接使用
 from scipy.io import wavfile  # WAV音频读取库：读取WAV文件，返回采样率和音频原始数据
 import pysptk  # 语音信号处理库：核心用于提取梅尔广义倒谱系数（MGC）、生成窗函数
 from scipy.spatial.distance import euclidean  # 欧氏距离计算：衡量两帧MGC系数的数值差异
@@ -11,6 +7,10 @@ from fastdtw import fastdtw  # 快速动态时间规整：解决两段音频帧�
 
 import whisper  # OpenAI语音识别模型：将音频转换为文本，为WER计算提供转录结果
 import jiwer  # 词错误率计算库：对比参考文本与转录文本，量化语音识别错误率
+
+import torch
+import torch.nn as nn
+import torchaudio.functional as F
 
 
 def compute_MCD(file_original, file_reconstructed):
@@ -114,7 +114,7 @@ def compute_MCD(file_original, file_reconstructed):
     return MCD_value  # 返回最终MCD评估结果
 
 
-def compute_WER():
+def compute_WER(original_text, file_dir):
     """
     计算语音转文本（ASR）的词错误率（WER）。
     WER通过对比"参考文本"（音频真实内容）和"转录文本"（模型识别结果），量化语音可懂度，

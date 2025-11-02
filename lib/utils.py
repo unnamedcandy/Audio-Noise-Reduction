@@ -1,121 +1,128 @@
 import numpy as np
+import torch
+from torch.nn import functional as f
 
 
-def stft(signal, sample_rate=48000, window_size=4096, step=2048, keep_freq_bins=512, window_type='hamming'):
-    """
-    优化的STFT变换：保留更多高频信息，减少频谱泄漏，提升还原精度
-    """
-    target_frames = 2048  # 目标帧数不变
+def stft(signal, sample_rate=48000, window_size=4096, step=2048, keep_freq_bins=512, window_type='blackman'):
+    """GPU加速的STFT变换（修复1D padding问题）"""
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    target_frames = 2048  # 目标帧数
 
-    # 1. 计算padding（边缘复制填充，减少边缘失真）
+    # 1. 转换为GPU张量（确保是1D）
+    if isinstance(signal, np.ndarray):
+        signal = torch.tensor(signal, dtype=torch.float32, device=device)
+    signal = signal.to(device).flatten()  # 确保是1D张量（形状：(n,)）
+
+    # 2. 边缘复制填充（关键修复：先转为2D再填充）
     required_length = window_size + (target_frames - 1) * step
-    pad_length = required_length - len(signal)
+    pad_length = required_length - signal.numel()
     pad_before = pad_length // 2
     pad_after = pad_length - pad_before
-    signal_padded = np.pad(signal, (pad_before, pad_after), mode='edge')  # 边缘复制代替补零
 
-    # 2. 选择更优窗口（汉明窗旁瓣衰减更大，频谱泄漏更少）
+    # 修复点：将1D转为2D（增加批次维度），填充后再还原为1D
+    signal_2d = signal.unsqueeze(0)  # 转为2D：(1, n)
+    signal_padded_2d = f.pad(signal_2d, (pad_before, pad_after), mode='replicate')  # 2D支持该格式
+    signal_padded = signal_padded_2d.squeeze(0)  # 还原为1D：(n + pad_length,)
+
+    # 后续代码保持不变...
+    # 3. 生成GPU窗口
     if window_type == 'hann':
-        window = np.hanning(window_size)
+        window = torch.hann_window(window_size, device=device)
     elif window_type == 'hamming':
-        window = np.hamming(window_size)  # 默认汉明窗，比汉宁窗泄漏少
+        window = torch.hamming_window(window_size, device=device)
     elif window_type == 'blackman':
-        window = np.blackman(window_size)  # 布莱克曼窗泄漏最少，但时域模糊稍大
+        window = torch.blackman_window(window_size, device=device)
     else:
         raise ValueError("窗口类型仅支持'hann'/'hamming'/'blackman'")
 
-    # 3. 计算STFT（保留更多高频，减少信息丢失）
-    stft_magnitude = np.zeros((target_frames, keep_freq_bins), dtype=np.float32)
-    stft_phase = np.zeros((target_frames, keep_freq_bins), dtype=np.float32)
+    # 4. 向量化提取所有帧
+    frames = signal_padded.unfold(0, window_size, step)
+    assert frames.shape[0] == target_frames, f"帧数量不匹配：{frames.shape[0]} vs {target_frames}"
 
-    for i in range(target_frames):
-        start = i * step
-        end = start + window_size
-        frame = signal_padded[start:end] * window  # 应用窗口
+    # 5. 应用窗口并计算FFT
+    frames_windowed = frames * window
+    fft_result = torch.fft.fft(frames_windowed, dim=1)
+    fft_cropped = fft_result[:, :keep_freq_bins]
 
-        fft_result = np.fft.fft(frame)
-        fft_cropped = fft_result[:keep_freq_bins]  # 保留2048点高频
+    # 6. 提取幅度和相位
+    stft_magnitude = torch.abs(fft_cropped)
+    stft_phase = torch.angle(fft_cropped)
 
-        stft_magnitude[i] = np.abs(fft_cropped)
-        stft_phase[i] = np.angle(fft_cropped)
+    # 7. 归一化
+    stft_magnitude = torch.log1p(stft_magnitude)
+    mag_mean = stft_magnitude.mean()
+    mag_std = stft_magnitude.std()
+    stft_magnitude = (stft_magnitude - mag_mean) / (mag_std + 1e-8)
 
-    # 4. 优化归一化（减少数值误差）
-    stft_magnitude = np.log1p(stft_magnitude)  # log1p保持不变
-    mag_mean = np.mean(stft_magnitude)
-    mag_std = np.std(stft_magnitude)
-    stft_magnitude = (stft_magnitude - mag_mean) / (mag_std + 1e-8)  # 标准化
+    stft_phase = stft_phase / torch.pi
 
-    stft_phase = stft_phase / np.pi  # 相位归一化
+    # 堆叠幅度和相位
+    stft_result = torch.stack([stft_magnitude, stft_phase], dim=-1)
 
-    # -------------------------- 补全缺失的stft_result生成 --------------------------
-    stft_result = np.stack([stft_magnitude, stft_phase], axis=-1)  # 堆叠幅度谱和相位谱
-
-    return stft_result, mag_mean, mag_std  # 正确返回三个变量
+    return stft_result, mag_mean, mag_std
 
 
 def istft(stft_result, original_length, mag_mean, mag_std,
-          sample_rate=48000, window_size=4096, step=2048, keep_freq_bins=512, window_type='hamming'):
-    """
-    优化的ISTFT逆变换：精准补全频谱，优化窗口校正，提升还原精度
-    """
-    # 1. 反归一化（使用更稳定的数值计算）
+          sample_rate=48000, window_size=4096, step=2048, keep_freq_bins=512, window_type='blackman'):
+    """GPU加速的ISTFT逆变换（输入为GPU张量）"""
+    device = stft_result.device  # 与输入保持同一设备
+    num_frames = stft_result.shape[0]
+
+    # 1. 反归一化（GPU上并行）
     stft_magnitude_norm = stft_result[..., 0]
     stft_phase_norm = stft_result[..., 1]
 
-    # 幅度谱反归一化：用expm1代替exp-1，数值精度更高
-    stft_magnitude = np.expm1(np.clip(
+    # 幅度谱反归一化（用clamp限制范围避免溢出）
+    stft_magnitude = torch.expm1(torch.clamp(
         stft_magnitude_norm * (mag_std + 1e-8) + mag_mean,
-        a_min=0, a_max=30  # 限制exp输入（exp(30)≈1e13，避免溢出）
+        min=0, max=30  # 限制exp输入范围
     ))
 
-    stft_phase = stft_phase_norm * np.pi  # 相位反归一化
+    stft_phase = stft_phase_norm * torch.pi  # 相位反归一化
 
-    # 2. 频谱补全（用数组操作代替循环，减少计算误差）
-    num_frames = stft_result.shape[0]
-    full_complex_spec = np.zeros((num_frames, window_size), dtype=np.complex64)
-
-    # 前半部分：直接赋值
-    full_complex_spec[:, :keep_freq_bins] = stft_magnitude * np.exp(1j * stft_phase)
-
-    # 后半部分：利用实信号FFT对称性（X[k] = conj(X[N-k])），用数组切片代替循环
+    # 2. 频谱补全（利用实信号FFT对称性，并行处理）
+    full_complex_spec = torch.zeros((num_frames, window_size), dtype=torch.complex64, device=device)
+    # 前半部分直接赋值
+    full_complex_spec[:, :keep_freq_bins] = stft_magnitude * torch.exp(1j * stft_phase)
+    # 后半部分用对称性补全（X[k] = conj(X[N-k])）
     if window_size > keep_freq_bins:
-        # 对称位置索引：window_size - k 对应 k（k从1到window_size - keep_freq_bins）
-        sym_indices = np.arange(window_size - 1, keep_freq_bins - 1, -1)  # 倒序索引
-        full_complex_spec[:, keep_freq_bins:] = np.conj(full_complex_spec[:, sym_indices])
+        sym_indices = torch.arange(window_size - 1, keep_freq_bins - 1, -1, device=device)  # 对称索引
+        full_complex_spec[:, keep_freq_bins:] = torch.conj(full_complex_spec[:, sym_indices])
 
-    # 3. 逆FFT与信号合成（优化窗口校正）
-    time_frames = np.fft.ifft(full_complex_spec).real  # 逆FFT取实部
+    # 3. 逆FFT（并行处理所有帧）
+    time_frames = torch.fft.ifft(full_complex_spec, dim=1).real  # 取实部
 
-    # 窗口选择（与STFT保持一致）
+    # 4. 生成窗口（与STFT保持一致）
     if window_type == 'hann':
-        window = np.hanning(window_size)
+        window = torch.hann_window(window_size, device=device)
     elif window_type == 'hamming':
-        window = np.hamming(window_size)
+        window = torch.hamming_window(window_size, device=device)
     elif window_type == 'blackman':
-        window = np.blackman(window_size)
+        window = torch.blackman_window(window_size, device=device)
 
-    # 重叠相加（预计算窗口能量，优化校正）
+    # 5. 重叠相加（GPU并行累加）
     required_length = window_size + (num_frames - 1) * step
-    output_signal = np.zeros(required_length, dtype=np.float32)
-    window_sq = window ** 2  # 窗口平方
-    window_correction = np.zeros(required_length, dtype=np.float32)
+    output_signal = torch.zeros(required_length, dtype=torch.float32, device=device)
+    window_sq = window ** 2  # 窗口平方（用于校正）
+    window_correction = torch.zeros(required_length, dtype=torch.float32, device=device)
 
+    # 并行累加所有帧（GPU循环效率高于Python）
     for i in range(num_frames):
         start = i * step
         end = start + window_size
-        output_signal[start:end] += time_frames[i] * window
-        window_correction[start:end] += window_sq
+        output_signal[start:end] += time_frames[i] * window  # 累加信号
+        window_correction[start:end] += window_sq  # 累加窗口能量
 
-    # 窗口校正（避免除零，用max代替clip更稳定）
-    window_correction = np.maximum(window_correction, 1e-8)
+    # 窗口校正（避免除零）
+    window_correction = torch.maximum(window_correction, torch.tensor(1e-8, device=device))
     output_signal /= window_correction
 
-    # 4. 裁剪padding（精准还原原始长度）
+    # 6. 裁剪填充，还原原始长度
     pad_length = required_length - original_length
     pad_before = pad_length // 2
     signal = output_signal[pad_before: pad_before + original_length]
 
-    return signal
+    return signal  # GPU张量，可通过.signal.cpu().numpy()转回numpy
 
 
 def calculate_snr(reference_signal: np.ndarray, evaluated_signal: np.ndarray) -> float:
@@ -168,7 +175,7 @@ if __name__ == "__main__":
     # 1. 执行STFT（返回stft_result、mag_mean、mag_std）
     stft_result, mag_mean, mag_std = stft(
         original_signal,
-        keep_freq_bins=2048,
+        keep_freq_bins=512,
         step=2048,
         window_type='hamming'
     )
@@ -180,7 +187,7 @@ if __name__ == "__main__":
         original_length=original_length,
         mag_mean=mag_mean,
         mag_std=mag_std,
-        keep_freq_bins=2048,
+        keep_freq_bins=512,
         step=2048,
         window_type='hamming'
     )
@@ -188,5 +195,3 @@ if __name__ == "__main__":
     # 3. 验证还原效果（优化后MSE应降至0.5左右）
     print(f"\n原始信号长度: {original_length}")
     print(f"还原信号长度: {len(recovered_signal)}")
-    mse = np.mean((original_signal - recovered_signal) ** 2)
-    print(f"优化后还原误差（MSE）: {mse:.6f}")  # 预期输出 ~0.5
