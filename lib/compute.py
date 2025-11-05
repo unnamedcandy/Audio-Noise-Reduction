@@ -8,10 +8,6 @@ from fastdtw import fastdtw  # 快速动态时间规整：解决两段音频帧�
 import whisper  # OpenAI语音识别模型：将音频转换为文本，为WER计算提供转录结果
 import jiwer  # 词错误率计算库：对比参考文本与转录文本，量化语音识别错误率
 
-import torch
-import torch.nn as nn
-import torchaudio.functional as F
-
 
 def compute_MCD(file_original, file_reconstructed):
     """

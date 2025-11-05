@@ -1,128 +1,115 @@
 import numpy as np
 import torch
-from torch.nn import functional as f
+import torch.nn as nn
+from torch.nn import functional as F
 
 
-def stft(signal, sample_rate=48000, window_size=4096, step=2048, keep_freq_bins=512, window_type='blackman'):
-    """GPU加速的STFT变换（修复1D padding问题）"""
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    target_frames = 2048  # 目标帧数
+class PhasenSTFT(nn.Module):
+    """
+    用于PHASEN模型的STFT预处理工具类，支持GPU加速，确保STFT返回单边谱、ISTFT接收单边谱输入，且预处理不参与训练。
+    保存STFT参数（窗长、步长、窗函数等），确保前后处理一致性。
+    """
 
-    # 1. 转换为GPU张量（确保是1D）
-    if isinstance(signal, np.ndarray):
-        signal = torch.tensor(signal, dtype=torch.float32, device=device)
-    signal = signal.to(device).flatten()  # 确保是1D张量（形状：(n,)）
+    def __init__(self,
+                 n_fft: int = 4096,
+                 hop_length: int = 1024,
+                 win_length: int = 4096,
+                 window_type: str = 'hamming'):
+        """
+        初始化STFT参数，创建窗函数并注册为缓冲区（不参与训练，支持设备同步）。
 
-    # 2. 边缘复制填充（关键修复：先转为2D再填充）
-    required_length = window_size + (target_frames - 1) * step
-    pad_length = required_length - signal.numel()
-    pad_before = pad_length // 2
-    pad_after = pad_length - pad_before
+        Args:
+            n_fft: FFT点数，PHASEN常用4096
+            hop_length: 帧移（步长），PHASEN常用1024
+            win_length: 窗长，通常与n_fft一致
+            window_type: 窗函数类型，支持'hann'或'hamming'
+        """
+        super().__init__()
+        # 保存STFT核心参数（ISTFT复用）
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self.win_length = win_length
+        self.n_freq = n_fft // 2 + 1  # 单边谱频点数量（固定值，便于形状管理）
 
-    # 修复点：将1D转为2D（增加批次维度），填充后再还原为1D
-    signal_2d = signal.unsqueeze(0)  # 转为2D：(1, n)
-    signal_padded_2d = f.pad(signal_2d, (pad_before, pad_after), mode='replicate')  # 2D支持该格式
-    signal_padded = signal_padded_2d.squeeze(0)  # 还原为1D：(n + pad_length,)
+        # 创建窗函数（用临时变量存储，通过register_buffer创建self.window）
+        if window_type == 'hann':
+            window = torch.hann_window(win_length)
+        elif window_type == 'hamming':
+            window = torch.hamming_window(win_length)
+        else:
+            raise ValueError(f"不支持的窗函数类型: {window_type}，可选'hann'或'hamming'")
+        self.register_buffer('window', window)
 
-    # 后续代码保持不变...
-    # 3. 生成GPU窗口
-    if window_type == 'hann':
-        window = torch.hann_window(window_size, device=device)
-    elif window_type == 'hamming':
-        window = torch.hamming_window(window_size, device=device)
-    elif window_type == 'blackman':
-        window = torch.blackman_window(window_size, device=device)
-    else:
-        raise ValueError("窗口类型仅支持'hann'/'hamming'/'blackman'")
+    def stft_preprocess(self, waveform: torch.Tensor) -> torch.Tensor:
+        """
+        对音频波形进行STFT变换，输出**单边谱**（实部+虚部），预处理步骤无梯度计算。
 
-    # 4. 向量化提取所有帧
-    frames = signal_padded.unfold(0, window_size, step)
-    assert frames.shape[0] == target_frames, f"帧数量不匹配：{frames.shape[0]} vs {target_frames}"
+        Args:
+            waveform: 输入音频波形，形状为 (batch_size, time) 或 (time,)（单条音频），实数值Tensor
 
-    # 5. 应用窗口并计算FFT
-    frames_windowed = frames * window
-    fft_result = torch.fft.fft(frames_windowed, dim=1)
-    fft_cropped = fft_result[:, :keep_freq_bins]
+        Returns:
+            stft_spec: STFT单边谱，形状为 (batch_size, n_freq, n_frame, 2)，其中：
+                - n_freq = n_fft//2 + 1（单边谱频点数量）
+                - n_frame为时间帧数量
+                - 最后一维[0]为实部，[1]为虚部（float32类型）
+        """
+        # 确保输入维度为(batch_size, time)
+        if waveform.dim() == 1:
+            waveform = waveform.unsqueeze(0)  # 单条音频增加batch维度
 
-    # 6. 提取幅度和相位
-    stft_magnitude = torch.abs(fft_cropped)
-    stft_phase = torch.angle(fft_cropped)
+        # 确保输入与窗函数在同一设备
+        waveform = waveform.to(self.window.device)
 
-    # 7. 归一化
-    stft_magnitude = torch.log1p(stft_magnitude)
-    mag_mean = stft_magnitude.mean()
-    mag_std = stft_magnitude.std()
-    stft_magnitude = (stft_magnitude - mag_mean) / (mag_std + 1e-8)
+        # 预处理不参与训练：禁用梯度计算
+        with torch.no_grad():
+            # 1. 计算STFT，返回复数张量（return_complex=True，适应新版本PyTorch）
+            stft_complex = torch.stft(
+                input=waveform,
+                n_fft=self.n_fft,
+                hop_length=self.hop_length,
+                win_length=self.win_length,
+                window=self.window,
+                center=True,
+                pad_mode='reflect',
+                normalized=False,
+                return_complex=True
+            )
+            # 2. 将复数张量转换为实部+虚部分离的格式（形状不变：[batch, n_freq, n_frame, 2]）
+            stft_spec = torch.view_as_real(stft_complex)
 
-    stft_phase = stft_phase / torch.pi
+        return stft_spec
 
-    # 堆叠幅度和相位
-    stft_result = torch.stack([stft_magnitude, stft_phase], dim=-1)
+    def istft_postprocess(self, stft_spec: torch.Tensor) -> torch.Tensor:
+        """
+        对PHASEN模型输出的**单边谱**进行ISTFT变换，还原为音频波形，无梯度计算。
 
-    return stft_result, mag_mean, mag_std
+        Args:
+            stft_spec: 单边谱（需与STFT输出格式一致），形状为 (batch_size, n_freq, n_frame, 2)，
+                最后一维[0]为实部，[1]为虚部（float32类型）
 
+        Returns:
+            waveform: 还原的音频波形，形状为 (batch_size, time)，实数值Tensor
+        """
+        # 确保输入与窗函数在同一设备
+        stft_spec = stft_spec.to(self.window.device)
 
-def istft(stft_result, original_length, mag_mean, mag_std,
-          sample_rate=48000, window_size=4096, step=2048, keep_freq_bins=512, window_type='blackman'):
-    """GPU加速的ISTFT逆变换（输入为GPU张量）"""
-    device = stft_result.device  # 与输入保持同一设备
-    num_frames = stft_result.shape[0]
+        # 后处理不参与训练：禁用梯度计算
+        with torch.no_grad():
+            # 1. 将实部+虚部分离的张量转换回复数张量（与stft输出对应）
+            stft_complex = torch.view_as_complex(stft_spec)
+            # 2. 计算ISTFT（输入为复数张量，适应新版本PyTorch）
+            waveform = torch.istft(
+                input=stft_complex,  # 关键：输入复数张量
+                n_fft=self.n_fft,
+                hop_length=self.hop_length,
+                win_length=self.win_length,
+                window=self.window,
+                center=True,
+                normalized=False,
+                return_complex=False  # 返回实数值波形
+            )
 
-    # 1. 反归一化（GPU上并行）
-    stft_magnitude_norm = stft_result[..., 0]
-    stft_phase_norm = stft_result[..., 1]
-
-    # 幅度谱反归一化（用clamp限制范围避免溢出）
-    stft_magnitude = torch.expm1(torch.clamp(
-        stft_magnitude_norm * (mag_std + 1e-8) + mag_mean,
-        min=0, max=30  # 限制exp输入范围
-    ))
-
-    stft_phase = stft_phase_norm * torch.pi  # 相位反归一化
-
-    # 2. 频谱补全（利用实信号FFT对称性，并行处理）
-    full_complex_spec = torch.zeros((num_frames, window_size), dtype=torch.complex64, device=device)
-    # 前半部分直接赋值
-    full_complex_spec[:, :keep_freq_bins] = stft_magnitude * torch.exp(1j * stft_phase)
-    # 后半部分用对称性补全（X[k] = conj(X[N-k])）
-    if window_size > keep_freq_bins:
-        sym_indices = torch.arange(window_size - 1, keep_freq_bins - 1, -1, device=device)  # 对称索引
-        full_complex_spec[:, keep_freq_bins:] = torch.conj(full_complex_spec[:, sym_indices])
-
-    # 3. 逆FFT（并行处理所有帧）
-    time_frames = torch.fft.ifft(full_complex_spec, dim=1).real  # 取实部
-
-    # 4. 生成窗口（与STFT保持一致）
-    if window_type == 'hann':
-        window = torch.hann_window(window_size, device=device)
-    elif window_type == 'hamming':
-        window = torch.hamming_window(window_size, device=device)
-    elif window_type == 'blackman':
-        window = torch.blackman_window(window_size, device=device)
-
-    # 5. 重叠相加（GPU并行累加）
-    required_length = window_size + (num_frames - 1) * step
-    output_signal = torch.zeros(required_length, dtype=torch.float32, device=device)
-    window_sq = window ** 2  # 窗口平方（用于校正）
-    window_correction = torch.zeros(required_length, dtype=torch.float32, device=device)
-
-    # 并行累加所有帧（GPU循环效率高于Python）
-    for i in range(num_frames):
-        start = i * step
-        end = start + window_size
-        output_signal[start:end] += time_frames[i] * window  # 累加信号
-        window_correction[start:end] += window_sq  # 累加窗口能量
-
-    # 窗口校正（避免除零）
-    window_correction = torch.maximum(window_correction, torch.tensor(1e-8, device=device))
-    output_signal /= window_correction
-
-    # 6. 裁剪填充，还原原始长度
-    pad_length = required_length - original_length
-    pad_before = pad_length // 2
-    signal = output_signal[pad_before: pad_before + original_length]
-
-    return signal  # GPU张量，可通过.signal.cpu().numpy()转回numpy
+        return waveform
 
 
 def calculate_snr(reference_signal: np.ndarray, evaluated_signal: np.ndarray) -> float:
@@ -167,31 +154,58 @@ def calculate_snr(reference_signal: np.ndarray, evaluated_signal: np.ndarray) ->
 
 # 验证优化效果（修正后可正常运行）
 if __name__ == "__main__":
-    # 生成测试信号（1048576帧，固定随机种子确保可复现）
+    # 生成测试信号（1048576帧随机噪声，固定种子确保可复现）
     np.random.seed(42)
-    original_signal = np.random.randn(1048576).astype(np.float32)
+    original_signal = np.random.randn(1048576).astype(np.float32)  # 约65秒（16kHz采样率下）
     original_length = len(original_signal)
+    print(f"原始信号长度: {original_length} 采样点")
 
-    # 1. 执行STFT（返回stft_result、mag_mean、mag_std）
-    stft_result, mag_mean, mag_std = stft(
-        original_signal,
-        keep_freq_bins=512,
-        step=2048,
-        window_type='hamming'
-    )
-    print(f"STFT输出形状: {stft_result.shape}")  # 应输出 (2048, 2048, 2)
+    # 转换为PyTorch张量（初始形状：(time,)）
+    waveform = torch.from_numpy(original_signal)
 
-    # 2. 执行ISTFT逆变换
-    recovered_signal = istft(
-        stft_result,
-        original_length=original_length,
-        mag_mean=mag_mean,
-        mag_std=mag_std,
-        keep_freq_bins=512,
-        step=2048,
+    # 初始化STFT处理器（使用PHASEN常用参数）
+    stft_processor = PhasenSTFT(
+        n_fft=4096,
+        hop_length=1024,
+        win_length=4096,
         window_type='hamming'
     )
 
-    # 3. 验证还原效果（优化后MSE应降至0.5左右）
-    print(f"\n原始信号长度: {original_length}")
-    print(f"还原信号长度: {len(recovered_signal)}")
+    # 自动选择设备（GPU优先）
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"使用设备: {device}")
+    stft_processor = stft_processor.to(device)
+    waveform = waveform.to(device)  # 移动输入到目标设备
+
+    # 1. STFT预处理（输出单边谱）
+    stft_spec = stft_processor.stft_preprocess(waveform)
+    print(f"STFT输出形状: {stft_spec.shape}")  # 预期: (1, 2049, n_frame, 2)
+    # 验证单边谱频点数量（n_fft//2 + 1 = 4096//2 + 1 = 2049）
+    assert stft_spec.shape[1] == 2049, f"STFT频点数量错误，预期2049，实际{stft_spec.shape[1]}"
+
+    # 2. ISTFT后处理（还原波形）
+    recon_waveform = stft_processor.istft_postprocess(stft_spec)
+    recon_length = recon_waveform.shape[1]
+    print(f"还原信号长度: {recon_length} 采样点")
+    print(f"原始与还原长度差异: {abs(recon_length - original_length)}")
+    # 验证长度差异在允许范围内（center=True时通常±1）
+    assert abs(recon_length - original_length) <= 1, "长度差异过大，可能参数不匹配"
+
+    # 3. 计算重建质量（信噪比SNR和均方误差MSE）
+    # 对齐长度（截取到较短的一方）
+    min_len = min(original_length, recon_length)
+    original_cropped = original_signal[:min_len]  # 原始信号（numpy）
+    recon_cropped = recon_waveform[0, :min_len].cpu().numpy()  # 还原信号（转CPU并转numpy）
+
+    # 计算MSE（均方误差）
+    mse = np.mean((original_cropped - recon_cropped) **2)
+    # 计算SNR（信噪比，单位dB）
+    signal_power = np.mean(original_cropped** 2)
+    snr = 10 * np.log10(signal_power / (mse + 1e-12))  # 加小值避免除零
+
+    print(f"重建均方误差 (MSE): {mse:.6f}")
+    print(f"重建信噪比 (SNR): {snr:.2f} dB")
+    # 验证重建质量（STFT+ISTFT理想重建SNR应远大于30dB）
+    assert snr > 30, f"重建质量不佳，SNR过低（{snr:.2f} dB）"
+
+    print("\n✅ 所有验证通过，STFT预处理和ISTFT后处理功能正常！")

@@ -6,7 +6,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 # 导入项目内部组件（与训练代码路径保持一致）
-from lib.model import UNetSpeechEnhancement  # 与训练一致的U-Net模型
+from lib.module import UNetSpeechEnhancement  # 与训练一致的U-Net模型
 from lib.utils import stft, istft  # 训练时用的STFT/ISTFT
 from lib.compute import compute_MCD  # 计算MCD的函数
 from lib.dataset import TestDataset  # 复用测试数据集类（关键：保证数据处理逻辑统一）

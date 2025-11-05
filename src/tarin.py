@@ -9,7 +9,7 @@ from datetime import datetime
 
 # 导入项目内部组件（确保路径与你的文件结构一致）
 from lib.dataset import TrainDataset  # 你的数据集类
-from lib.model import UNetSpeechEnhancement  # 你的U-Net模型
+from lib.module import UNetSpeechEnhancement  # 你的U-Net模型
 from lib.utils import stft  # 你的STFT变换函数（时域→频谱）
 
 
@@ -65,7 +65,7 @@ def train_speech_enhancement(
     model = UNetSpeechEnhancement(
         in_channels=2,    # 输入通道：幅度谱+相位谱
         out_channels=2,   # 输出通道：预测的干净语音幅度谱+相位谱
-        base_filters=8   # 基础卷积核数量（可调整，越大模型越复杂）
+        base_filters=16   # 基础卷积核数量（可调整，越大模型越复杂）
     ).to(device)  # 移到目标设备
 
     # 损失函数：MSE损失（频谱特征像素级差异，适合语音增强）
